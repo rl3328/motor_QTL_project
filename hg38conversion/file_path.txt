@@ -1,0 +1,2 @@
+# Content of bed_annotations.bed.file.index or bed_annotations.bed.file_path.txt
+/mnt/lustre/home/rl3328/rl3328/motor_qtl/GWAS/unadjusted_GWAS_hg19.bed
