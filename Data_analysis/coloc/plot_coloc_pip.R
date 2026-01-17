@@ -1,5 +1,6 @@
 #!/usr/bin/env Rscript
-# Colocalization plotting with PIP on y-axis and larger fonts
+# Colocalization data extraction and plotting with PIP on y-axis
+# Separated into two functions: extract_coloc_data() and plot_coloc_from_data()
 
 library(data.table)
 library(tidyverse)
@@ -16,54 +17,40 @@ cs_colors <- c(
   "CS_0.50" = "#009E73"   # Green - lower confidence CS
 )
 
-plot_colocalization_pip <- function(gene_id,
-                                     eqtl_bed_file,
-                                     gwas_file,
-                                     gene_name = NULL,
-                                     zoom_window = NULL,
-                                     gwas_threshold = 5e-8,
-                                     pip_threshold = 0.01,
-                                     output_file = NULL,
-                                     plot_width = NULL,
-                                     plot_height = 12) {
+################################################################################
+# FUNCTION 1: Extract and save colocalization data
+################################################################################
 
-  # Read eQTL data for the gene
-  cat(sprintf("Reading eQTL data for gene: %s\n", gene_id))
+extract_coloc_data <- function(gene_id,
+                                eqtl_data,
+                                gwas_file_path,
+                                gene_name = NULL,
+                                zoom_window = NULL,
+                                gwas_threshold = 5e-8,
+                                pip_threshold = 0.01,
+                                data_dir = "./data") {
 
-  # Read the full bed file and filter by gene
-  eqtl_data <- fread(cmd = sprintf("zcat %s", eqtl_bed_file), header = TRUE)
-  setnames(eqtl_data, "#chr", "chr")
+  cat(sprintf("Extracting data for gene: %s\n", gene_id))
+
+  # Rename #chr to chr if needed
+  if ("#chr" %in% names(eqtl_data)) {
+    setnames(eqtl_data, "#chr", "chr")
+  }
 
   # Filter for this gene
   gene_data <- eqtl_data[gene_ID == gene_id]
+  cat(sprintf("Found %d variants\n", nrow(gene_data)))
 
-  if (nrow(gene_data) == 0) {
-    stop(sprintf("No data found for gene %s", gene_id))
-  }
-
-  cat(sprintf("Found %d variants for gene %s\n", nrow(gene_data), gene_id))
-
-  # Get chromosome (should be consistent)
-  region_chr <- unique(gene_data$chr)
-  if (length(region_chr) > 1) {
-    warning("Multiple chromosomes found, using first one")
-    region_chr <- region_chr[1]
-  }
-  region_chr <- as.character(region_chr)
+  # Get chromosome
+  region_chr <- as.character(unique(gene_data$chr)[1])
 
   # Determine plotting region
   if (!is.null(zoom_window)) {
     plot_start <- as.integer(zoom_window[1])
     plot_end <- as.integer(zoom_window[2])
-    cat(sprintf("Using zoom window: chr%s:%d-%d\n", region_chr, plot_start, plot_end))
   } else {
-    # Use range of variants with PIP above threshold
     sig_variants <- gene_data[PIP > pip_threshold]
-
-    if (nrow(sig_variants) == 0) {
-      # If no variants above threshold, use all
-      sig_variants <- gene_data
-    }
+    if (nrow(sig_variants) == 0) sig_variants <- gene_data
 
     plot_start <- as.integer(min(sig_variants$start))
     plot_end <- as.integer(max(sig_variants$end))
@@ -72,9 +59,9 @@ plot_colocalization_pip <- function(gene_id,
     padding <- as.integer((plot_end - plot_start) * 0.1)
     plot_start <- max(1, plot_start - padding)
     plot_end <- plot_end + padding
-
-    cat(sprintf("Using variant range: chr%s:%d-%d\n", region_chr, plot_start, plot_end))
   }
+
+  cat(sprintf("Region: chr%s:%d-%d\n", region_chr, plot_start, plot_end))
 
   # Filter to plotting region
   eqtl_plot_data <- gene_data[start >= plot_start & end <= plot_end]
@@ -88,41 +75,92 @@ plot_colocalization_pip <- function(gene_id,
   # Use midpoint for plotting
   eqtl_plot_data[, pos := (start + end) / 2]
 
-  cat(sprintf("\nPlotting %d total variants\n", nrow(eqtl_plot_data)))
-
   # Count CS variants
   cs_counts <- eqtl_plot_data[!is.na(cs), .N, by = cs]
-  if (nrow(cs_counts) > 0) {
-    cat("Credible set variants:\n")
-    print(cs_counts)
-  } else {
-    cat("No credible set variants found\n")
-  }
-
-  # Separate background and CS variants
   bg_variants <- eqtl_plot_data[is.na(cs)]
   cs_variants <- eqtl_plot_data[!is.na(cs)]
 
-  cat(sprintf("  Background: %d variants\n", nrow(bg_variants)))
-  cat(sprintf("  In credible sets: %d variants\n", nrow(cs_variants)))
+  cat(sprintf("eQTL: %d variants (%d in CS)\n", nrow(eqtl_plot_data), nrow(cs_variants)))
 
-  # Read GWAS data
-  cat("\nReading GWAS data...\n")
-  gwas_query <- sprintf("tabix %s %s:%d-%d", gwas_file, region_chr, plot_start, plot_end)
-  cat("Query:", gwas_query, "\n")
-
-  gwas_data <- fread(cmd = gwas_query, header = FALSE,
-                     col.names = c("chr", "pos", "A1", "A2", "SNP", "effect_allele_frequency",
-                                   "INFO", "beta", "se", "p", "n_sample"))
-
-  if (nrow(gwas_data) == 0) {
-    stop(sprintf("No GWAS data found in region chr%s:%d-%d", region_chr, plot_start, plot_end))
+  # Query GWAS data - try both chr formats
+  gwas_chr_formats <- if (grepl("^chr", region_chr)) {
+    c(region_chr, gsub("^chr", "", region_chr))
+  } else {
+    c(region_chr, paste0("chr", region_chr))
   }
 
-  cat(sprintf("GWAS: %d variants in region\n", nrow(gwas_data)))
+  gwas_data <- NULL
+  for (gwas_chr in gwas_chr_formats) {
+    gwas_query <- sprintf("tabix %s %s:%d-%d", gwas_file_path, gwas_chr, plot_start, plot_end)
+    gwas_data <- tryCatch({
+      fread(cmd = gwas_query, header = FALSE,
+            col.names = c("chr", "pos", "A1", "A2", "SNP", "effect_allele_frequency",
+                          "INFO", "beta", "se", "p", "n_sample"))
+    }, error = function(e) NULL)
+
+    if (!is.null(gwas_data) && nrow(gwas_data) > 0) break
+  }
+
+  cat(sprintf("GWAS: %d variants\n", nrow(gwas_data)))
 
   # Calculate -log10(p) for GWAS
   gwas_data[, neg_log_p := -log10(pmax(p, 1e-300))]
+
+  # Save data
+  if (!dir.exists(data_dir)) dir.create(data_dir, recursive = TRUE)
+
+  finemap_data <- list(
+    gene_id = gene_id,
+    gene_name = gene_name,
+    region = list(chr = region_chr, start = plot_start, end = plot_end),
+    eqtl_data = eqtl_plot_data,
+    gwas_data = gwas_data,
+    thresholds = list(gwas_threshold = gwas_threshold, pip_threshold = pip_threshold),
+    metadata = list(
+      n_variants_total = nrow(eqtl_plot_data),
+      n_variants_bg = nrow(bg_variants),
+      n_variants_cs = nrow(cs_variants),
+      cs_counts = if(nrow(cs_counts) > 0) as.data.frame(cs_counts) else NULL
+    )
+  )
+
+  data_file <- file.path(data_dir, sprintf("%s_finemap.rds", gene_id))
+  saveRDS(finemap_data, data_file)
+  cat(sprintf("Saved: %s\n", data_file))
+
+  invisible(finemap_data)
+}
+
+################################################################################
+# FUNCTION 2: Load saved data and create plots
+################################################################################
+
+plot_coloc_from_data <- function(gene_id,
+                                  data_dir = "./data",
+                                  output_file = NULL,
+                                  plot_width = NULL,
+                                  plot_height = 12) {
+
+  # Load saved data
+  data_file <- file.path(data_dir, sprintf("%s_finemap.rds", gene_id))
+  finemap_data <- readRDS(data_file)
+
+  # Extract components
+  gene_name <- finemap_data$gene_name
+  region_chr <- finemap_data$region$chr
+  plot_start <- finemap_data$region$start
+  plot_end <- finemap_data$region$end
+  eqtl_plot_data <- finemap_data$eqtl_data
+  gwas_data <- finemap_data$gwas_data
+  gwas_threshold <- finemap_data$thresholds$gwas_threshold
+  bg_variants <- eqtl_plot_data[is.na(cs)]
+  cs_variants <- eqtl_plot_data[!is.na(cs)]
+
+  cat(sprintf("Plotting %s (%d eQTL, %d GWAS variants)\n",
+              gene_id, nrow(eqtl_plot_data), nrow(gwas_data)))
+
+
+  # Calculate threshold
   gwas_threshold_y <- -log10(gwas_threshold)
 
   # LARGE FONT SIZES (increased from original)
@@ -217,35 +255,15 @@ plot_colocalization_pip <- function(gene_id,
   # Calculate plot width
   if (is.null(plot_width)) {
     region_mb <- (plot_end - plot_start) / 1e6
-    plot_width <- min(18, max(10, region_mb * 2))  # Slightly wider
+    plot_width <- min(18, max(10, region_mb * 2))
   }
 
   # Save plot
   if (!is.null(output_file)) {
-    cat(sprintf("\nSaving plot to: %s\n", output_file))
     ggsave(output_file, plot = p_combined,
            width = plot_width, height = plot_height, dpi = 300, bg = "white")
+    cat(sprintf("Saved: %s\n", output_file))
   }
 
-  cat("\nPlot complete!\n")
-  return(p_combined)
-}
-
-
-# Test if run as script
-if (!interactive()) {
-  cat("==========================================\n")
-  cat("Testing PIP-based colocalization plot\n")
-  cat("==========================================\n\n")
-
-  p1 <- plot_colocalization_pip(
-    gene_id = "ENSG00000188338",
-    eqtl_bed_file = "DLPFC_DeJager_eQTL.exported.toploci.bed.gz",
-    gwas_file = "GWAS/unadjusted_wp_ukb.sumstats_hg38_sorted.tsv.gz",
-    output_file = "colocalization_ENSG00000188338_PIP.png"
-  )
-
-  cat("\n==========================================\n")
-  cat("Test completed successfully!\n")
-  cat("==========================================\n")
+  p_combined
 }
