@@ -19,17 +19,18 @@ suppressPackageStartupMessages({
 ################################################################################
 
 # Data paths
-# EQTL_DIR <- "/mnt/lustre/home/rl3328/rl3328/motor_qtl/eQTL"
-# GWAS_FILE <- "/mnt/lustre/home/rl3328/rl3328/motor_qtl/GWAS/unadjusted_wp_ukb.sumstats_hg38_sorted.tsv.gz"
+EQTL_DIR <- "/mnt/lustre/home/rl3328/rl3328/motor_qtl/eQTL"
+GWAS_FILE <- "/mnt/lustre/home/rl3328/rl3328/motor_qtl/GWAS/unadjusted_wp_ukb.sumstats_hg38_sorted.tsv.gz"
 
 # Tissue names
-TISSUES <- c("Quad", "VM", "SMA")
+TISSUES <- c("Quad", "VM", "SMA", "DLPFC")
 
 # Color palette for tissues and GWAS
 TISSUE_COLORS <- c(
   "Quad" = "#1D96C3",   # Blue
   "SMA" = "#A24443",    # Red
   "VM" = "#73A58B",     # Green
+  "DLPFC" = "#7A78B6",  # Bright lavender-blue (brain region)
   "GWAS" = "#35464A"    # Dark gray
 )
 
@@ -61,10 +62,18 @@ load_eqtl_data <- function(tissue,
 
   tissue_dir <- file.path(EQTL_DIR, tissue)
 
-  # Find relevant files
+  # Find relevant files - different naming patterns for different tissues
   if (!is.null(chromosome)) {
     chr_str <- paste0("chr", chromosome)
-    pattern <- paste0("*", chr_str, "_", chr_str, ".cis_qtl.pairs.tsv.gz")
+
+    # DLPFC uses pattern: *chr{N}.mol_phe_chr{N}.cis_qtl.pairs.tsv.gz
+    # Muscle tissues use pattern: *chr{N}_chr{N}.cis_qtl.pairs.tsv.gz
+    if (tissue == "DLPFC") {
+      pattern <- paste0("*", chr_str, ".mol_phe_", chr_str, ".cis_qtl.pairs.tsv.gz")
+    } else {
+      pattern <- paste0("*", chr_str, "_", chr_str, ".cis_qtl.pairs.tsv.gz")
+    }
+
     files <- list.files(tissue_dir, pattern = pattern, full.names = TRUE)
   } else {
     files <- list.files(tissue_dir, pattern = "*.cis_qtl.pairs.tsv.gz", full.names = TRUE)
@@ -211,7 +220,7 @@ extract_region_data <- function(chromosome,
                                 center_pos,
                                 window_size = 500000,
                                 gene_id = NULL,
-                                tissues = c("Quad", "VM", "SMA")) {
+                                tissues = c("Quad", "VM", "SMA", "DLPFC")) {
 
   # Ensure proper types
   chromosome <- as.character(chromosome)
@@ -297,6 +306,8 @@ save_extracted_data <- function(data_list, file_path) {
 #' Plot multi-panel figure from extracted data
 #'
 #' @param data_list Data list from extract_region_data() or loaded from RDS
+#' @param tissues_to_plot Character vector of tissues to plot (default: all available tissues). Use NULL to plot all.
+#' @param include_gwas Logical, whether to include GWAS panel (default: TRUE)
 #' @param panel_heights Relative heights for panels (GWAS, then tissues)
 #' @param total_width Total figure width in inches
 #' @param total_height Total figure height in inches
@@ -306,13 +317,25 @@ save_extracted_data <- function(data_list, file_path) {
 #' @param gene_name_map Named vector mapping ENSG IDs to gene names (e.g., c("ENSG00000141458" = "NPC1"))
 #' @return Combined plot object (patchwork)
 plot_extracted_data <- function(data_list,
-                                panel_heights = c(1, 0.8, 0.8, 0.8),
+                                tissues_to_plot = NULL,
+                                include_gwas = TRUE,
+                                panel_heights = c(1, 0.8, 0.8, 0.8, 0.8),
                                 total_width = 12,
-                                total_height = 10,
+                                total_height = 12,
                                 show_thresholds = TRUE,
                                 plot_title = NULL,
                                 save_path = NULL,
                                 gene_name_map = NULL) {
+
+  # Validate input data
+  if (!is.list(data_list)) {
+    stop("Error: 'data_list' must be a list. Did you load the data with readRDS()?")
+  }
+
+  if (!all(c("metadata", "gwas", "eqtl") %in% names(data_list))) {
+    stop("Error: 'data_list' is missing required elements (metadata, gwas, eqtl).\n",
+         "Make sure you extracted data using extract_region_data() or loaded from RDS.")
+  }
 
   # Load patchwork for combining plots
   if (!requireNamespace("patchwork", quietly = TRUE)) {
@@ -324,6 +347,26 @@ plot_extracted_data <- function(data_list,
   meta <- data_list$metadata
   gwas_df <- data_list$gwas
   eqtl_list <- data_list$eqtl
+
+  # Determine which tissues to plot
+  if (is.null(tissues_to_plot)) {
+    # Use all available tissues from the data
+    tissues_to_plot <- meta$tissues
+  } else {
+    # Validate that requested tissues are available
+    available_tissues <- names(eqtl_list)
+    invalid_tissues <- setdiff(tissues_to_plot, available_tissues)
+    if (length(invalid_tissues) > 0) {
+      warning(sprintf("Requested tissues not found in data: %s",
+                      paste(invalid_tissues, collapse = ", ")))
+    }
+    # Filter to only available tissues
+    tissues_to_plot <- intersect(tissues_to_plot, available_tissues)
+  }
+
+  if (length(tissues_to_plot) == 0 && !include_gwas) {
+    stop("No tissues to plot and GWAS panel disabled. Nothing to display.")
+  }
 
   # Create title with gene name
   if (is.null(plot_title)) {
@@ -353,7 +396,7 @@ plot_extracted_data <- function(data_list,
   plots <- list()
 
   # --- GWAS Panel ---
-  if (nrow(gwas_df) > 0) {
+  if (include_gwas && nrow(gwas_df) > 0) {
     gwas_df[, neg_log_p := -log10(pmax(p, 1e-300))]
 
     p_gwas <- ggplot(gwas_df, aes(x = pos, y = neg_log_p)) +
@@ -386,7 +429,7 @@ plot_extracted_data <- function(data_list,
   }
 
   # --- eQTL Panels (one per tissue) ---
-  for (tissue in meta$tissues) {
+  for (tissue in tissues_to_plot) {
     if (tissue %in% names(eqtl_list)) {
       tissue_data <- eqtl_list[[tissue]]
       tissue_data[, neg_log_p := -log10(pmax(pvalue, 1e-300))]
@@ -506,7 +549,7 @@ find_genes_on_chromosome <- function(chromosome, tissues = c("Quad")) {
 check_gene_tissues <- function(gene_id, chromosome) {
   cat(sprintf("Checking which tissues have data for %s on chr%s...\n\n", gene_id, chromosome))
 
-  for (tissue in c("Quad", "VM", "SMA")) {
+  for (tissue in c("Quad", "VM", "SMA", "DLPFC")) {
     df <- load_eqtl_data(tissue, chromosome, gene_id = gene_id)
     if (nrow(df) > 0) {
       cat(sprintf("✓ %s: %s variants (p-value range: %.2e - %.2e)\n",
